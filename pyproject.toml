@@ -1,0 +1,23 @@
+[project]
+name = "debate-fastapi-reference"
+version = "0.1.0"
+description = "Reference FastAPI app demonstrating debaterhub-sdk Mode 1 and Mode 2"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "David Gonier" }]
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "pydantic-settings>=2.0.0",
+    "debaterhub-sdk @ git+https://github.com/dgonier/debaterhub-sdk.git",
+]
+
+[project.urls]
+Homepage = "https://github.com/dgonier/debate-fastapi-reference"
+Repository = "https://github.com/dgonier/debate-fastapi-reference"
+SDK = "https://github.com/dgonier/debaterhub-sdk"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
