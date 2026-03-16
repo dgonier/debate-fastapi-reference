@@ -47,6 +47,8 @@ async def debate_websocket(ws: WebSocket, debate_id: str):
             data = await ws.receive_json()
             action = data.get("action", "")
 
+            logger.info("WS action: %s", action)
+
             if action == "submit_speech":
                 await session.submit_speech(
                     speech_type=data["speech_type"],

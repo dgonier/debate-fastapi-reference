@@ -1,4 +1,4 @@
-# WebSocket Protocol
+# WebSocket Protocol Reference
 
 ## Connection
 
@@ -6,127 +6,316 @@
 WS /debates/{debate_id}/ws
 ```
 
-Connect after creating a managed debate via `POST /debates/managed`. The server accepts the WebSocket and begins streaming events.
+Connect after creating a debate via `POST /debates/managed`. If the debate ID doesn't exist, the connection closes immediately with code `4004`.
 
-## Server → Client (Events)
+On connect, any events that arrived before your WebSocket connected are flushed (the handler buffers them).
 
-All messages are JSON objects with a `type` field:
+## Events (Server -> Client)
 
-```json
-{"type": "debate_initializing", "topic": "...", "human_side": "aff", "message": "...", "estimated_seconds": 30}
-{"type": "debate_ready", "topic": "...", "human_side": "aff", "speech_order": [...], "speech_time_limits": {...}}
-{"type": "turn_signal", "speech_type": "AC", "speaker": "human", "is_cx": false, "time_limit": 300, "speech_index": 0, "status": "active"}
-{"type": "speech_text", "speech_type": "NC", "text": "...", "word_count": 450}
-{"type": "speech_progress", "speech_type": "NC", "stage": "skeleton", "message": "Building argument structure..."}
-{"type": "flow_update", "speech_type": "AC", "flow": {...}}
-{"type": "coaching_hint", "for_speech": "1AR", "hints": [{...}]}
-{"type": "speech_scored", "speech_type": "AC", "score": 0.75, "feedback": "...", "dimensions": [{...}]}
-{"type": "cx_question", "question": "...", "turn_number": 1, "strategy": "..."}
-{"type": "cx_answer", "answer": "...", "question_ref": "..."}
-{"type": "evidence_result", "query": "...", "cards": [{...}], "total_results": 5}
-{"type": "judging_started", "message": "...", "estimated_seconds": 30}
-{"type": "judge_result", "winner": "aff", "aff_score": 0.82, "neg_score": 0.71, "margin": "clear", "decision": "...", "voting_issues": [...]}
-{"type": "belief_tree", "tree": {...}}
-{"type": "error", "message": "...", "code": "UNKNOWN", "recoverable": true}
-{"type": "disconnect", "reason": "..."}
-```
+Every event is a JSON object with a `type` field. Below is every event type with its full payload.
 
-## Client → Server (Actions)
+### debate_initializing
 
-Send JSON with an `action` field:
-
-### Submit a speech
+Sent when the agent joins the room and starts preparing.
 
 ```json
 {
-  "action": "submit_speech",
+  "type": "debate_initializing",
+  "topic": "The US should adopt universal basic income",
+  "human_side": "aff",
+  "message": "Preparing debate...",
+  "estimated_seconds": 30
+}
+```
+
+### debate_ready
+
+All prep is done, the debate is about to begin.
+
+```json
+{
+  "type": "debate_ready",
+  "topic": "The US should adopt universal basic income",
+  "human_side": "aff",
+  "speech_order": ["AC", "AC-CX", "NC", "NC-CX", "1AR", "NR", "2AR"],
+  "speech_time_limits": {"AC": 300, "AC-CX": 180, "NC": 360, "NC-CX": 180, "1AR": 300, "NR": 300, "2AR": 180}
+}
+```
+
+### turn_signal
+
+**The most important event.** Tells you whose turn it is and what they should do.
+
+```json
+{
+  "type": "turn_signal",
   "speech_type": "AC",
-  "transcript": "I argue that artificial intelligence will benefit society...",
-  "duration_seconds": 245.5,
-  "word_count": 420
+  "speaker": "human",
+  "is_cx": false,
+  "time_limit": 300,
+  "speech_index": 0,
+  "status": "active"
 }
 ```
 
-- `speech_type` (required): Which speech to submit (`"AC"`, `"1AR"`, `"2AR"`)
-- `transcript` (required): Full speech text
-- `duration_seconds` (optional, default 0): How long the speech took
-- `word_count` (optional): Auto-calculated from transcript if omitted
+`status` values:
+- `"waiting"` — about to start (brief pause)
+- `"active"` — this turn is live, submit speech or ask/answer CX
+- `"prep_time"` — prep time before a rebuttal, send `end_prep_time` when ready
+- `"complete"` — debate is over
 
-### CX question
+`speaker` values:
+- `"human"` — the human debater should act
+- `"ai"` — the AI is generating/speaking (just wait)
+
+### speech_text
+
+AI-generated speech text. Only sent for AI speeches (NC, NR when human is aff).
 
 ```json
 {
-  "action": "cx_question",
-  "question": "Can you explain your second contention?",
-  "turn_number": 1
+  "type": "speech_text",
+  "speech_type": "NC",
+  "text": "The resolution should be negated because...",
+  "word_count": 650
 }
 ```
 
-### CX answer
+### speech_progress
+
+Progress updates during AI speech generation.
 
 ```json
 {
-  "action": "cx_answer",
-  "answer": "What I meant was that the economic data shows...",
-  "question_ref": "optional-reference-to-question"
+  "type": "speech_progress",
+  "speech_type": "NC",
+  "stage": "skeleton",
+  "message": "Building argument structure..."
 }
 ```
 
-### End CX period
+Stages in order: `tactic` → `skeleton` → `evidence` → `speech`
+
+### cx_question
+
+A cross-examination question (from AI or echoed back from human).
 
 ```json
 {
-  "action": "end_cx",
-  "speech_type": "AC-CX"
+  "type": "cx_question",
+  "question": "What specific evidence supports your second contention?",
+  "turn_number": 2,
+  "strategy": "probe_evidence"
 }
 ```
 
-### Skip CX period
+### cx_answer
+
+A cross-examination answer.
 
 ```json
 {
-  "action": "skip_cx",
-  "speech_type": "AC-CX"
+  "type": "cx_answer",
+  "answer": "The evidence comes from the 2023 Stanford study...",
+  "question_ref": "What specific evidence..."
 }
 ```
 
-### End prep time
+### coaching_hint
+
+Strategic coaching for the human's upcoming speech.
 
 ```json
 {
-  "action": "end_prep_time"
+  "type": "coaching_hint",
+  "for_speech": "1AR",
+  "hints": [
+    {"priority": "high", "category": "refutation", "text": "Address the opponent's cost argument first"},
+    {"priority": "medium", "category": "extension", "text": "Extend your economic growth contention"}
+  ]
 }
 ```
 
-### Request coaching
+### flow_update
+
+Argument flow visualization — tracks which arguments are standing, attacked, dropped, etc.
 
 ```json
 {
-  "action": "request_coaching",
-  "for_speech": "1AR"
+  "type": "flow_update",
+  "speech_type": "1AR",
+  "flow": {
+    "arguments": [...],
+    "clash_points": [...],
+    "voting_issues": [...]
+  }
 }
 ```
 
-### Request evidence
+### evidence_result
+
+Response to a `request_evidence` action.
 
 ```json
 {
-  "action": "request_evidence",
-  "query": "economic impact of artificial intelligence",
-  "limit": 5
+  "type": "evidence_result",
+  "query": "economic impact of UBI",
+  "cards": [
+    {"tag": "UBI reduces poverty", "fulltext": "...", "source": "Stanford 2023", "cite": "..."}
+  ],
+  "total_results": 12
 }
 ```
+
+### speech_scored
+
+Per-speech score and feedback.
+
+```json
+{
+  "type": "speech_scored",
+  "speech_type": "AC",
+  "score": 0.75,
+  "feedback": "Strong thesis but evidence could be more specific",
+  "dimensions": [
+    {"name": "argumentation", "score": 0.8, "max_score": 1.0, "reasoning": "..."},
+    {"name": "evidence", "score": 0.6, "max_score": 1.0, "reasoning": "..."}
+  ]
+}
+```
+
+### belief_tree
+
+The argument tree for the debate topic.
+
+```json
+{
+  "type": "belief_tree",
+  "tree": {
+    "topic": "UBI",
+    "beliefs": [
+      {"id": "b1", "side": "aff", "claim": "UBI reduces poverty", "arguments": [...]},
+      {"id": "b2", "side": "neg", "claim": "UBI is too expensive", "arguments": [...]}
+    ]
+  }
+}
+```
+
+### judging_started
+
+The panel judge is evaluating the complete debate.
+
+```json
+{
+  "type": "judging_started",
+  "message": "Panel judge is evaluating the debate...",
+  "estimated_seconds": 60
+}
+```
+
+### judge_result
+
+**The final event.** Who won and why.
+
+```json
+{
+  "type": "judge_result",
+  "winner": "aff",
+  "aff_score": 0.82,
+  "neg_score": 0.71,
+  "margin": "clear",
+  "decision": "The affirmative demonstrated a stronger...",
+  "voting_issues": ["Economic impact", "Feasibility"]
+}
+```
+
+### error
+
+Something went wrong.
+
+```json
+{
+  "type": "error",
+  "message": "Speech generation failed",
+  "code": "GENERATION_ERROR",
+  "recoverable": true
+}
+```
+
+If `recoverable` is `false`, the debate cannot continue.
+
+### disconnect
+
+The debate session has ended.
+
+```json
+{
+  "type": "disconnect",
+  "reason": "client requested disconnect"
+}
+```
+
+## Actions (Client -> Server)
+
+Send JSON with an `action` field. Unknown actions receive an error response.
+
+| Action | Required Fields | Optional Fields | When to Send |
+|--------|----------------|-----------------|-------------|
+| `submit_speech` | `speech_type`, `transcript` | `duration_seconds`, `word_count` | When `turn_signal` has `speaker: "human"` and `is_cx: false` |
+| `cx_question` | `question` | `turn_number` | During CX when human is the questioner |
+| `cx_answer` | `answer` | `question_ref` | When `cx_question` event received and human is the answerer |
+| `end_cx` | `speech_type` | — | To end a CX period early |
+| `skip_cx` | `speech_type` | — | To skip CX entirely |
+| `end_prep_time` | — | — | When `turn_signal` has `status: "prep_time"` |
+| `request_coaching` | `for_speech` | — | Any time before/during a human speech |
+| `request_evidence` | `query` | `limit` (default 5) | Any time during the debate |
 
 ## Error Handling
 
-If an unknown action is sent:
-
+Unknown actions:
 ```json
 {"type": "error", "message": "Unknown action: invalid_action"}
 ```
 
-If the debate session is not found when connecting:
+Debate not found on connect:
+```
+WebSocket closed with code 4004, reason: "Debate {id} not found"
+```
+
+## Typical Event Sequence (Human as Aff)
 
 ```
-WebSocket closed with code 4004, reason: "Debate abc123 not found"
+debate_initializing
+belief_tree              (may arrive, depends on agent prep)
+debate_ready
+turn_signal              AC / human / active
+  → submit_speech AC
+turn_signal              AC-CX / ai / active
+cx_question              AI asks
+  → cx_answer
+cx_question              AI asks again
+  → cx_answer
+  → end_cx
+turn_signal              NC / ai / active
+speech_progress          tactic...skeleton...evidence...speech
+speech_text              NC generated
+flow_update
+turn_signal              NC-CX / human / active
+  → cx_question
+cx_answer                AI answers
+  → cx_question
+  → end_cx
+turn_signal              1AR / human / prep_time
+  → end_prep_time
+turn_signal              1AR / human / active
+coaching_hint
+  → submit_speech 1AR
+turn_signal              NR / ai / active
+speech_progress
+speech_text              NR generated
+flow_update
+turn_signal              2AR / human / active
+  → submit_speech 2AR
+judging_started
+judge_result             winner!
 ```

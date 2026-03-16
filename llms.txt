@@ -1,0 +1,166 @@
+# debate-fastapi-reference
+
+> FastAPI sidecar server for running IPDA debates via the debaterhub-sdk. A client app connects via WebSocket, submits human speeches, and receives AI speeches, scoring, and judge results.
+
+## What this repo is
+
+A FastAPI server that wraps the `debaterhub-sdk` Python package. It manages LiveKit rooms, dispatches a Modal-hosted AI debate agent, and bridges all communication through a WebSocket for the client. The client never touches LiveKit directly.
+
+## Tech stack
+
+- Python 3.11+, FastAPI, uvicorn, pydantic-settings
+- `debaterhub-sdk` (installed from git) — LiveKit data channel client, event parsing, session management
+- LiveKit Cloud — real-time room infrastructure
+- Modal — hosts the AI debate agent (Claude Bedrock + DSPy pipeline + Kokoro TTS)
+- pytest, httpx, websockets — testing
+
+## Project structure
+
+```
+app/
+  main.py           — FastAPI app, lifespan cleanup, CORS, route registration
+  config.py         — pydantic-settings: loads LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET, DEBATE_AGENT_NAME, WARMUP_URL from .env
+  store.py          — In-memory dict: debate_id → ManagedDebateSession (no persistence)
+  handler.py        — WebSocketDebateHandler(DebateEventHandler): bridges SDK events → WebSocket, stores event_history and belief_tree for REST queries
+  auto_debater.py   — Mock human WebSocket client for E2E testing, auto-submits speeches and CX answers
+  routes/
+    debates.py      — REST: POST /debates/managed, POST /debates/token-only, GET status/belief-tree/events/transcripts
+    ws.py           — WebSocket endpoint: attaches handler, receives actions, dispatches to session
+tests/
+  conftest.py       — Sets dummy env vars so app imports work without .env
+  test_endpoints.py — 14 unit tests (mock session, test all REST endpoints)
+  test_e2e.py       — Full 7-speech E2E test using AutoDebater (needs live server + agent)
+static/
+  index.html        — Built-in test UI
+docs/
+  architecture.md   — Data flow diagrams, session lifecycle, extension guide
+  websocket-protocol.md — Full event/action reference with payloads
+```
+
+## How it works
+
+1. Client calls `POST /debates/managed` with `{topic, human_side}` → gets `{debate_id}`
+2. Client connects `WS /debates/{debate_id}/ws` → receives events, sends actions
+3. The sidecar creates a LiveKit room, dispatches the AI agent, and joins as a data-only participant
+4. SDK events from the agent (speech_text, turn_signal, judge_result, etc.) are forwarded to the WebSocket
+5. Client actions (submit_speech, cx_answer, end_cx, etc.) are sent to the agent via LiveKit data channel
+
+## IPDA debate format
+
+7 speeches in fixed order: AC, AC-CX, NC, NC-CX, 1AR, NR, 2AR
+- AC/1AR/2AR are Affirmative speeches
+- NC/NR are Negative speeches
+- AC-CX: Neg questions Aff about the AC
+- NC-CX: Aff questions Neg about the NC
+- If human_side="aff", human delivers AC/1AR/2AR and questions in NC-CX, answers in AC-CX
+- If human_side="neg", human delivers NC/NR and questions in AC-CX, answers in NC-CX
+
+## WebSocket events (server → client)
+
+All JSON with a `type` field:
+- `debate_initializing` — agent preparing, show loading
+- `debate_ready` — debate starting, includes speech_order and time_limits
+- `turn_signal` — whose turn, what speech, status (active/waiting/prep_time/complete)
+- `speech_text` — AI-generated speech text (only for AI speeches)
+- `speech_progress` — generation stages: tactic → skeleton → evidence → speech
+- `cx_question` — cross-examination question
+- `cx_answer` — cross-examination answer
+- `coaching_hint` — strategic advice for human's next speech
+- `flow_update` — argument flow (standing/attacked/dropped arguments)
+- `evidence_result` — evidence cards from search
+- `speech_scored` — per-speech score (0-1) with dimensional feedback
+- `belief_tree` — argument tree with aff/neg beliefs
+- `judging_started` — panel judge evaluating
+- `judge_result` — winner, scores, decision, voting issues
+- `error` — error with message, code, recoverable flag
+- `disconnect` — session ended
+
+## WebSocket actions (client → server)
+
+JSON with an `action` field:
+- `submit_speech` — {speech_type, transcript, duration_seconds?, word_count?}
+- `cx_question` — {question, turn_number?}
+- `cx_answer` — {answer, question_ref?}
+- `end_cx` — {speech_type}
+- `skip_cx` — {speech_type}
+- `end_prep_time` — {}
+- `request_coaching` — {for_speech}
+- `request_evidence` — {query, limit?}
+
+## REST endpoints
+
+- `POST /debates/managed` — create debate → {debate_id}
+- `POST /debates/token-only` — alternative: get LiveKit token for direct connection
+- `GET /debates/{id}/status` — current_speech, phase, is_human_turn, completed_speeches
+- `GET /debates/{id}/belief-tree` — full belief tree
+- `GET /debates/{id}/belief-tree/{side}` — filtered by aff/neg
+- `GET /debates/{id}/events` — all events, timestamped (supports ?event_type=X&since=T)
+- `GET /debates/{id}/transcripts` — all speech transcripts
+
+## Key classes from debaterhub-sdk
+
+```python
+from debaterhub import (
+    DebateClient,           # Creates rooms, dispatches agent
+    DebateConfig,           # topic, human_side, coaching_enabled, evidence_enabled
+    ManagedDebateSession,   # Mode 2: backend joins room, routes events
+    DebateEventHandler,     # Base class with on_<event>() methods
+    DebateTurnTracker,      # Tracks current speech, phase, transcripts
+    IPDA_SPEECH_ORDER,      # ["AC", "AC-CX", "NC", "NC-CX", "1AR", "NR", "2AR"]
+    SPEECH_TIME_LIMITS,     # {"AC": 300, "AC-CX": 180, ...}
+)
+```
+
+## Handler pattern
+
+`WebSocketDebateHandler` inherits `DebateEventHandler` and overrides all `on_<event>()` methods. Each method:
+1. Records the event in `_event_history` (with timestamp)
+2. Stores special data (belief_tree, debate_config)
+3. Forwards to the WebSocket (or buffers if WS not yet connected)
+
+## Testing
+
+- Unit tests: `pytest tests/test_endpoints.py -v` — uses mock sessions, tests REST endpoints
+- E2E test: `RUN_E2E=1 pytest tests/test_e2e.py -v -s --timeout=2400` — full 7-speech debate (~25 min)
+- The E2E skip guard checks `RUN_E2E` env var — won't run without it
+
+## Environment
+
+`.env` file (see `.env.example`):
+```
+LIVEKIT_URL=wss://...
+LIVEKIT_API_KEY=...
+LIVEKIT_API_SECRET=...
+DEBATE_AGENT_NAME=human-debate-agent
+WARMUP_URL=https://...modal.run    # call this before first debate to wake agent
+```
+
+## Common tasks
+
+### Add a new REST endpoint
+1. Add route function in `app/routes/debates.py`
+2. Access session via `store.get(debate_id)` and handler via `session._handler_ref`
+3. Add test in `tests/test_endpoints.py`
+
+### Add a new WebSocket action
+1. Add `elif action == "my_action":` block in `app/routes/ws.py`
+2. Call the appropriate `session.method()`
+3. The SDK's `ManagedDebateSession` has: submit_speech, submit_cx_question, submit_cx_answer, end_cx, skip_cx, end_prep_time, request_coaching, request_evidence
+
+### Add a new event handler
+1. Override `on_my_event()` in `app/handler.py`
+2. Call `await self._forward({...})` to send to WebSocket and record in history
+3. Store any persistent data as instance attributes for REST access
+
+### Change session storage
+Replace `app/store.py` with Redis/PostgreSQL. The store API is: add(id, session), get(id), remove(id), all_ids().
+
+## Gotchas
+
+- The `.env` file uses `DEBATE_AGENT_NAME=human-debate-agent` (not `human-debate`)
+- Config is loaded at module import time (`settings = Settings()` in config.py) — env vars must be set before import
+- The `WARMUP_URL` is essential: without it, the Modal agent container is asleep and dispatches go unanswered
+- Human speeches don't emit `speech_text` events — those are only for AI-generated speeches
+- CX roles depend on speech type: in AC-CX the NEG asks questions; in NC-CX the AFF asks questions
+- `handler.attach(ws)` replaces any previous WebSocket — only one client per debate at a time
+- Event history and session state are in-memory only — lost on server restart

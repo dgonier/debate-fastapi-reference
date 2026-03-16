@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Dict, List
+import time
+from typing import Any, Dict, List, Optional
 
 from fastapi import WebSocket
 
@@ -35,11 +36,33 @@ class WebSocketDebateHandler(DebateEventHandler):
 
     If no WebSocket is connected yet, events are buffered and flushed
     once a client attaches via :meth:`attach`.
+
+    Stores event history, belief tree, and debate config for REST queries.
     """
 
     def __init__(self) -> None:
         self._ws: WebSocket | None = None
         self._buffer: List[Dict[str, Any]] = []
+        self._event_history: List[Dict[str, Any]] = []
+        self._belief_tree: Optional[Dict[str, Any]] = None
+        self._debate_config: Optional[Dict[str, Any]] = None
+
+    # -- public accessors --
+
+    @property
+    def event_history(self) -> List[Dict[str, Any]]:
+        """All events received, timestamped."""
+        return list(self._event_history)
+
+    @property
+    def belief_tree(self) -> Optional[Dict[str, Any]]:
+        """Most recent belief tree, or None."""
+        return self._belief_tree
+
+    @property
+    def debate_config(self) -> Optional[Dict[str, Any]]:
+        """Debate config from the initializing event."""
+        return self._debate_config
 
     async def attach(self, ws: WebSocket) -> None:
         """Attach a WebSocket and flush any buffered events."""
@@ -53,7 +76,13 @@ class WebSocketDebateHandler(DebateEventHandler):
 
     # -- internal helpers --
 
+    def _record(self, data: Dict[str, Any]) -> None:
+        """Append a timestamped copy to event history."""
+        entry = {**data, "timestamp": time.time()}
+        self._event_history.append(entry)
+
     async def _forward(self, data: Dict[str, Any]) -> None:
+        self._record(data)
         if self._ws is not None:
             await self._safe_send(data)
         else:
@@ -68,6 +97,10 @@ class WebSocketDebateHandler(DebateEventHandler):
     # -- event handlers (all 15 + disconnect) --
 
     async def on_debate_initializing(self, event: DebateInitializingEvent) -> None:
+        self._debate_config = {
+            "topic": event.topic,
+            "human_side": event.human_side,
+        }
         await self._forward({
             "type": "debate_initializing",
             "topic": event.topic,
@@ -185,6 +218,7 @@ class WebSocketDebateHandler(DebateEventHandler):
         })
 
     async def on_belief_tree(self, event: BeliefTreeEvent) -> None:
+        self._belief_tree = event.tree
         await self._forward({
             "type": "belief_tree",
             "tree": event.tree,

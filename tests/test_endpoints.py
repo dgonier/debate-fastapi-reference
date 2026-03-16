@@ -1,0 +1,208 @@
+"""Unit tests for REST endpoints — uses mocked handler/session state."""
+
+from __future__ import annotations
+
+import time
+from unittest.mock import MagicMock, patch
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app.main import app
+from app import store
+from app.handler import WebSocketDebateHandler
+
+
+@pytest.fixture(autouse=True)
+def _clear_store():
+    """Clear the in-memory store before each test."""
+    store._sessions.clear()
+    yield
+    store._sessions.clear()
+
+
+@pytest.fixture
+def client():
+    return TestClient(app)
+
+
+def _make_fake_session(
+    debate_id: str = "test123",
+    human_side: str = "aff",
+    belief_tree: dict | None = None,
+    events: list | None = None,
+    transcripts: dict | None = None,
+    completed_speeches: list | None = None,
+) -> MagicMock:
+    """Create a mock ManagedDebateSession with a real handler."""
+    handler = WebSocketDebateHandler()
+
+    # Pre-populate handler state
+    if belief_tree is not None:
+        handler._belief_tree = belief_tree
+    if events is not None:
+        handler._event_history = events
+
+    # Mock session with tracker
+    session = MagicMock()
+    session.connected = True
+    session._handler_ref = handler
+
+    tracker = MagicMock()
+    tracker.human_side = human_side
+    tracker.current_speech = "AC"
+    tracker.current_speaker = "human"
+    tracker.phase = "active"
+    tracker.is_human_turn = True
+    tracker.is_cx = False
+    tracker.is_complete = False
+    tracker.completed_speeches = completed_speeches or []
+    tracker.transcripts = transcripts or {}
+    session.tracker = tracker
+
+    store.add(debate_id, session)
+    return session
+
+
+# ── Status endpoint ──────────────────────────────────────────────────
+
+class TestStatusEndpoint:
+    def test_status_returns_tracker_state(self, client):
+        _make_fake_session("abc", transcripts={"AC": "speech text"}, completed_speeches=["AC"])
+        resp = client.get("/debates/abc/status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["debate_id"] == "abc"
+        assert data["connected"] is True
+        assert data["current_speech"] == "AC"
+        assert data["phase"] == "active"
+        assert data["is_human_turn"] is True
+
+    def test_status_404_when_not_found(self, client):
+        resp = client.get("/debates/nonexistent/status")
+        assert resp.status_code == 404
+
+
+# ── Belief tree endpoints ────────────────────────────────────────────
+
+class TestBeliefTreeEndpoint:
+    def test_belief_tree_returns_tree(self, client):
+        tree = {
+            "beliefs": [
+                {"id": "b1", "side": "aff", "claim": "Change is good"},
+                {"id": "b2", "side": "neg", "claim": "Status quo works"},
+            ],
+            "topic": "Test topic",
+        }
+        _make_fake_session("bt1", belief_tree=tree)
+        resp = client.get("/debates/bt1/belief-tree")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["debate_id"] == "bt1"
+        assert data["tree"]["topic"] == "Test topic"
+        assert len(data["tree"]["beliefs"]) == 2
+
+    def test_belief_tree_null_when_not_available(self, client):
+        _make_fake_session("bt2")
+        resp = client.get("/debates/bt2/belief-tree")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["tree"] is None
+
+    def test_belief_tree_404(self, client):
+        resp = client.get("/debates/nope/belief-tree")
+        assert resp.status_code == 404
+
+    def test_belief_tree_filtered_by_side(self, client):
+        tree = {
+            "beliefs": [
+                {"id": "b1", "side": "aff", "claim": "Pro argument"},
+                {"id": "b2", "side": "neg", "claim": "Con argument"},
+                {"id": "b3", "side": "aff", "claim": "Another pro"},
+            ],
+        }
+        _make_fake_session("bt3", belief_tree=tree)
+
+        resp = client.get("/debates/bt3/belief-tree/aff")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["side"] == "aff"
+        assert len(data["beliefs"]) == 2
+        assert all(b["side"] == "aff" for b in data["beliefs"])
+
+    def test_belief_tree_invalid_side(self, client):
+        _make_fake_session("bt4")
+        resp = client.get("/debates/bt4/belief-tree/both")
+        assert resp.status_code == 400
+
+
+# ── Events endpoint ──────────────────────────────────────────────────
+
+class TestEventsEndpoint:
+    def test_events_returns_history(self, client):
+        events = [
+            {"type": "debate_initializing", "topic": "Test", "timestamp": 1000.0},
+            {"type": "debate_ready", "topic": "Test", "timestamp": 1001.0},
+            {"type": "turn_signal", "speech_type": "AC", "timestamp": 1002.0},
+        ]
+        _make_fake_session("ev1", events=events)
+        resp = client.get("/debates/ev1/events")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["count"] == 3
+        assert len(data["events"]) == 3
+
+    def test_events_filter_by_type(self, client):
+        events = [
+            {"type": "turn_signal", "speech_type": "AC", "timestamp": 1000.0},
+            {"type": "speech_text", "speech_type": "AC", "timestamp": 1001.0},
+            {"type": "turn_signal", "speech_type": "AC-CX", "timestamp": 1002.0},
+        ]
+        _make_fake_session("ev2", events=events)
+        resp = client.get("/debates/ev2/events?event_type=turn_signal")
+        data = resp.json()
+        assert data["count"] == 2
+
+    def test_events_filter_since(self, client):
+        events = [
+            {"type": "turn_signal", "timestamp": 1000.0},
+            {"type": "speech_text", "timestamp": 2000.0},
+            {"type": "turn_signal", "timestamp": 3000.0},
+        ]
+        _make_fake_session("ev3", events=events)
+        resp = client.get("/debates/ev3/events?since=1500")
+        data = resp.json()
+        assert data["count"] == 2
+
+    def test_events_404(self, client):
+        resp = client.get("/debates/nope/events")
+        assert resp.status_code == 404
+
+
+# ── Transcripts endpoint ─────────────────────────────────────────────
+
+class TestTranscriptsEndpoint:
+    def test_transcripts_returns_data(self, client):
+        _make_fake_session(
+            "tr1",
+            transcripts={"AC": "My case...", "NC": "Counter case..."},
+            completed_speeches=["AC", "NC"],
+        )
+        resp = client.get("/debates/tr1/transcripts")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["debate_id"] == "tr1"
+        assert "AC" in data["transcripts"]
+        assert "NC" in data["transcripts"]
+        assert data["completed_speeches"] == ["AC", "NC"]
+
+    def test_transcripts_empty(self, client):
+        _make_fake_session("tr2")
+        resp = client.get("/debates/tr2/transcripts")
+        data = resp.json()
+        assert data["transcripts"] == {}
+        assert data["completed_speeches"] == []
+
+    def test_transcripts_404(self, client):
+        resp = client.get("/debates/nope/transcripts")
+        assert resp.status_code == 404

@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     livekit_url: str
     livekit_api_key: str
     livekit_api_secret: str
-    debate_agent_name: str = "human-debate"
+    debate_agent_name: str = "human-debate-agent"
     warmup_url: str = ""
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}

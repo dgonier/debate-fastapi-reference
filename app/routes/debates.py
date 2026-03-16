@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -131,3 +132,81 @@ async def get_status(debate_id: str):
         is_complete=t.is_complete,
         completed_speeches=t.completed_speeches,
     )
+
+
+# ── Belief Tree ──────────────────────────────────────────────────────
+
+def _get_handler(debate_id: str) -> WebSocketDebateHandler:
+    session = store.get(debate_id)
+    if session is None:
+        raise HTTPException(404, f"Debate {debate_id} not found")
+    return session._handler_ref  # type: ignore[attr-defined]
+
+
+@router.get("/{debate_id}/belief-tree")
+async def get_belief_tree(debate_id: str) -> Dict[str, Any]:
+    """Return the full belief tree for this debate."""
+    handler = _get_handler(debate_id)
+    tree = handler.belief_tree
+    if tree is None:
+        return {"debate_id": debate_id, "tree": None, "message": "Belief tree not yet available"}
+    return {"debate_id": debate_id, "tree": tree}
+
+
+@router.get("/{debate_id}/belief-tree/{side}")
+async def get_belief_tree_by_side(debate_id: str, side: str) -> Dict[str, Any]:
+    """Return beliefs filtered by side (aff or neg)."""
+    if side not in ("aff", "neg"):
+        raise HTTPException(400, "side must be 'aff' or 'neg'")
+
+    handler = _get_handler(debate_id)
+    tree = handler.belief_tree
+    if tree is None:
+        return {"debate_id": debate_id, "side": side, "beliefs": [], "message": "Belief tree not yet available"}
+
+    # Filter beliefs by side if the tree has a beliefs list
+    beliefs = tree.get("beliefs", [])
+    filtered = [b for b in beliefs if b.get("side", "").lower() == side]
+    return {"debate_id": debate_id, "side": side, "beliefs": filtered}
+
+
+# ── Event History ────────────────────────────────────────────────────
+
+@router.get("/{debate_id}/events")
+async def get_events(
+    debate_id: str,
+    event_type: Optional[str] = None,
+    since: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Return event history. Supports filtering by type and timestamp.
+
+    Query params:
+    - event_type: filter to a specific event type (e.g. "speech_text")
+    - since: only events after this unix timestamp (for replay/catch-up)
+    """
+    handler = _get_handler(debate_id)
+    events = handler.event_history
+
+    if event_type:
+        events = [e for e in events if e.get("type") == event_type]
+    if since is not None:
+        events = [e for e in events if e.get("timestamp", 0) > since]
+
+    return {"debate_id": debate_id, "events": events, "count": len(events)}
+
+
+# ── Transcripts ──────────────────────────────────────────────────────
+
+@router.get("/{debate_id}/transcripts")
+async def get_transcripts(debate_id: str) -> Dict[str, Any]:
+    """Return all recorded speech transcripts."""
+    session = store.get(debate_id)
+    if session is None:
+        raise HTTPException(404, f"Debate {debate_id} not found")
+
+    t = session.tracker
+    return {
+        "debate_id": debate_id,
+        "transcripts": t.transcripts,
+        "completed_speeches": t.completed_speeches,
+    }
