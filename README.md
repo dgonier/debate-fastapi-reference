@@ -51,7 +51,32 @@ cx_answer ────────────>     data channel ─────
 
 ## Integration Guide
 
-### 1. Create a Debate
+### 1a. Create a Topic (Reusable)
+
+Create a topic once, run multiple debates against it. The belief tree gets cached after the first debate so subsequent debates skip the ~30s prep.
+
+```http
+POST /debates/topics
+Content-Type: application/json
+
+{ "topic": "The United States should adopt universal basic income" }
+```
+
+Response:
+```json
+{ "topic_id": "f1a2b3c4d5e6", "topic": "The United States should adopt universal basic income", "has_belief_tree": false, "debate_count": 0 }
+```
+
+Then use `topic_id` when creating debates:
+
+```http
+POST /debates/managed
+{ "topic_id": "f1a2b3c4d5e6", "human_side": "aff" }
+```
+
+### 1b. Create a Debate (One-Shot)
+
+Or skip topic creation and pass the topic inline:
 
 ```http
 POST /debates/managed
@@ -67,7 +92,7 @@ Content-Type: application/json
 
 Response:
 ```json
-{ "debate_id": "a1b2c3d4e5f6", "message": "Session created. Connect via WebSocket at /debates/a1b2c3d4e5f6/ws" }
+{ "debate_id": "a1b2c3d4e5f6", "topic": "The United States should adopt universal basic income", "message": "Session created. Connect via WebSocket." }
 ```
 
 ### 2. Connect WebSocket
@@ -164,20 +189,29 @@ If `human_side` is `"neg"`, the human delivers NC, NR, asks in AC-CX, and answer
 
 ## REST Endpoints
 
-All REST endpoints are available alongside the WebSocket for querying state at any time:
+### Topics (create once, debate many times)
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/debates/managed` | Create a new debate session → `{debate_id}` |
+| `POST` | `/debates/topics` | Create a reusable topic → `{topic_id}` |
+| `GET` | `/debates/topics` | List all topics |
+| `GET` | `/debates/topics/{id}` | Get topic details + debate count |
+| `GET` | `/debates/topics/{id}/belief-tree` | Get cached belief tree for a topic |
+
+### Debates
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/debates/managed` | Create debate (pass `topic` or `topic_id`) → `{debate_id}` |
 | `POST` | `/debates/token-only` | Alternative: get LiveKit token for direct frontend connection |
-| `GET` | `/debates/{id}/status` | Current turn tracker: `current_speech`, `phase`, `is_human_turn`, `completed_speeches` |
-| `GET` | `/debates/{id}/belief-tree` | Full belief tree with all arguments and evidence |
+| `GET` | `/debates/{id}/status` | Turn tracker: `current_speech`, `phase`, `is_human_turn`, `completed_speeches` |
+| `GET` | `/debates/{id}/belief-tree` | Full belief tree for this debate |
 | `GET` | `/debates/{id}/belief-tree/aff` | Affirmative beliefs only |
 | `GET` | `/debates/{id}/belief-tree/neg` | Negative beliefs only |
-| `GET` | `/debates/{id}/events` | Full event history (all events, timestamped) |
-| `GET` | `/debates/{id}/events?event_type=speech_text` | Filter events by type |
-| `GET` | `/debates/{id}/events?since=1710000000.0` | Events after a timestamp (for catch-up) |
-| `GET` | `/debates/{id}/transcripts` | All recorded speech transcripts |
+| `GET` | `/debates/{id}/events` | Full event history (timestamped) |
+| `GET` | `/debates/{id}/events?event_type=X` | Filter by event type |
+| `GET` | `/debates/{id}/events?since=T` | Events after timestamp (catch-up) |
+| `GET` | `/debates/{id}/transcripts` | All speech transcripts |
 | `WS` | `/debates/{id}/ws` | WebSocket for live events and actions |
 
 ### Observer / Late-Join Pattern
@@ -197,6 +231,58 @@ curl http://localhost:8000/debates/{id}/belief-tree
 # 4. Connect WebSocket for live events going forward
 wscat -c ws://localhost:8000/debates/{id}/ws
 ```
+
+## Belief Tree Structure
+
+The belief tree is the argument map generated during debate prep. Query it via `GET /debates/{id}/belief-tree` or `GET /debates/topics/{id}/belief-tree`.
+
+```json
+{
+  "tree": {
+    "topic": "The United States should adopt universal basic income",
+    "generated_at": "2026-03-16T03:02:40Z",
+    "beliefs": [
+      {
+        "id": "b1",
+        "side": "aff",
+        "label": "Contention 1: Poverty Reduction",
+        "claim": "UBI directly reduces poverty rates",
+        "arguments": [
+          {
+            "id": "a1",
+            "claim": "UBI provides unconditional income floor",
+            "warrant": "Guaranteed income eliminates extreme poverty by definition",
+            "impact": "15-40% poverty reduction based on pilot programs",
+            "label": "Income Floor Argument",
+            "evidence": [
+              {
+                "tag": "Stanford Basic Income Lab 2023",
+                "fulltext": "A randomized controlled trial of 1,000 participants...",
+                "source": "Stanford University",
+                "cite": "West et al., 2023",
+                "source_url": "https://basicincome.stanford.edu/research"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "b2",
+        "side": "neg",
+        "label": "Contention 1: Fiscal Unsustainability",
+        "claim": "UBI costs exceed available funding",
+        "arguments": [...]
+      }
+    ]
+  }
+}
+```
+
+**Hierarchy:** Tree → Beliefs (by side) → Arguments → Evidence Cards
+
+Filter by side to get only the arguments you need:
+- `GET /debates/{id}/belief-tree/aff` — affirmative arguments only
+- `GET /debates/{id}/belief-tree/neg` — negative arguments only
 
 ## Testing
 

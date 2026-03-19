@@ -219,6 +219,10 @@ class WebSocketDebateHandler(DebateEventHandler):
 
     async def on_belief_tree(self, event: BeliefTreeEvent) -> None:
         self._belief_tree = event.tree
+        # Cache on the linked topic (if debate was created via topic_id)
+        topic_ref = getattr(self, "_topic_ref", None)
+        if topic_ref is not None and topic_ref.belief_tree is None:
+            topic_ref.belief_tree = event.tree
         await self._forward({
             "type": "belief_tree",
             "tree": event.tree,

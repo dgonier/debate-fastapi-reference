@@ -89,10 +89,17 @@ JSON with an `action` field:
 
 ## REST endpoints
 
-- `POST /debates/managed` — create debate → {debate_id}
+Topics (reusable — create once, debate many times):
+- `POST /debates/topics` — create topic → {topic_id}
+- `GET /debates/topics` — list all topics
+- `GET /debates/topics/{id}` — get topic details
+- `GET /debates/topics/{id}/belief-tree` — cached belief tree for topic
+
+Debates:
+- `POST /debates/managed` — create debate (pass `topic` or `topic_id`) → {debate_id}
 - `POST /debates/token-only` — alternative: get LiveKit token for direct connection
 - `GET /debates/{id}/status` — current_speech, phase, is_human_turn, completed_speeches
-- `GET /debates/{id}/belief-tree` — full belief tree
+- `GET /debates/{id}/belief-tree` — full belief tree (hierarchy: tree → beliefs → arguments → evidence)
 - `GET /debates/{id}/belief-tree/{side}` — filtered by aff/neg
 - `GET /debates/{id}/events` — all events, timestamped (supports ?event_type=X&since=T)
 - `GET /debates/{id}/transcripts` — all speech transcripts

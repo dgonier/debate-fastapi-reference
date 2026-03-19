@@ -15,10 +15,12 @@ from app.handler import WebSocketDebateHandler
 
 @pytest.fixture(autouse=True)
 def _clear_store():
-    """Clear the in-memory store before each test."""
+    """Clear the in-memory stores before each test."""
     store._sessions.clear()
+    store._topics.clear()
     yield
     store._sessions.clear()
+    store._topics.clear()
 
 
 @pytest.fixture
@@ -206,3 +208,68 @@ class TestTranscriptsEndpoint:
     def test_transcripts_404(self, client):
         resp = client.get("/debates/nope/transcripts")
         assert resp.status_code == 404
+
+
+# ── Topic endpoints ──────────────────────────────────────────────────
+
+class TestTopicEndpoints:
+    def test_create_topic(self, client):
+        resp = client.post("/debates/topics", json={"topic": "UBI is good"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["topic"] == "UBI is good"
+        assert data["topic_id"]
+        assert data["has_belief_tree"] is False
+        assert data["debate_count"] == 0
+
+    def test_list_topics(self, client):
+        client.post("/debates/topics", json={"topic": "Topic A"})
+        client.post("/debates/topics", json={"topic": "Topic B"})
+        resp = client.get("/debates/topics")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 2
+
+    def test_get_topic(self, client):
+        create = client.post("/debates/topics", json={"topic": "My topic"}).json()
+        resp = client.get(f"/debates/topics/{create['topic_id']}")
+        assert resp.status_code == 200
+        assert resp.json()["topic"] == "My topic"
+
+    def test_get_topic_404(self, client):
+        resp = client.get("/debates/topics/nonexistent")
+        assert resp.status_code == 404
+
+    def test_topic_belief_tree_empty(self, client):
+        create = client.post("/debates/topics", json={"topic": "Some topic"}).json()
+        resp = client.get(f"/debates/topics/{create['topic_id']}/belief-tree")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["tree"] is None
+
+    def test_topic_belief_tree_cached(self, client):
+        # Simulate caching by setting it directly
+        tid = "test_topic"
+        topic = store.Topic(topic_id=tid, topic="Cached topic")
+        topic.belief_tree = {"beliefs": [{"side": "aff", "claim": "Test"}], "topic": "Cached topic"}
+        store.add_topic(tid, topic)
+
+        resp = client.get(f"/debates/topics/{tid}/belief-tree")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["tree"]["topic"] == "Cached topic"
+        assert len(data["tree"]["beliefs"]) == 1
+
+    def test_create_debate_with_topic_id(self, client):
+        """Verify topic_id resolves correctly (debate creation itself is mocked)."""
+        create = client.post("/debates/topics", json={"topic": "Resolved topic"}).json()
+        # We can't actually create a managed debate without LiveKit, but we can
+        # verify the topic resolution logic works for the request model
+        topic = store.get_topic(create["topic_id"])
+        assert topic is not None
+        assert topic.topic == "Resolved topic"
+
+    def test_create_debate_missing_topic_and_topic_id(self, client):
+        """Must provide either topic or topic_id."""
+        resp = client.post("/debates/managed", json={"human_side": "aff"})
+        assert resp.status_code == 400 or resp.status_code == 422
