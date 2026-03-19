@@ -1,7 +1,9 @@
-"""Topic and debate endpoints."""
+"""Topic and debate endpoints — all creation is non-blocking."""
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -14,6 +16,7 @@ from ..config import settings
 from ..handler import WebSocketDebateHandler
 from .. import store
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/debates", tags=["debates"])
 
 
@@ -36,9 +39,11 @@ class CreateTopicRequest(BaseModel):
 class TopicResponse(BaseModel):
     topic_id: str
     topic: str
+    status: str = "pending"  # pending | ready | failed
     has_belief_tree: bool = False
     debate_count: int = 0
     debate_ids: list[str] = []
+    error: str | None = None
 
 
 class CreateDebateRequest(BaseModel):
@@ -59,29 +64,35 @@ class ManagedResponse(BaseModel):
     debate_id: str
     topic_id: str | None = None
     topic: str
-    message: str = "Session created. Connect via WebSocket."
+    status: str = "creating"
+    message: str = "Debate is being created. Connect via WebSocket for events."
 
 
 class StatusResponse(BaseModel):
     debate_id: str
     connected: bool
-    current_speech: str | None
-    current_speaker: str | None
-    phase: str
-    is_human_turn: bool
-    is_cx: bool
-    is_complete: bool
-    completed_speeches: list[str]
+    status: str  # creating | ready | failed | active | complete
+    current_speech: str | None = None
+    current_speaker: str | None = None
+    phase: str = "creating"
+    is_human_turn: bool = False
+    is_cx: bool = False
+    is_complete: bool = False
+    completed_speeches: list[str] = []
+    error: str | None = None
 
 
 # ── Topics ───────────────────────────────────────────────────────────
 
 @router.post("/topics", response_model=TopicResponse, tags=["topics"])
 async def create_topic(req: CreateTopicRequest):
-    """Create a reusable topic. Run multiple debates against the same topic.
+    """Create a reusable topic.
 
-    The belief tree will be generated on the first debate and cached here
-    so subsequent debates skip the ~30s prep time.
+    Returns immediately. The belief tree is generated when the first
+    debate on this topic runs (and cached for all subsequent debates).
+
+    Poll ``GET /debates/topics/{id}`` to check if the tree is ready,
+    or just start a debate — it will build the tree if needed.
     """
     topic_id = uuid.uuid4().hex[:12]
     topic = store.Topic(topic_id=topic_id, topic=req.topic)
@@ -97,7 +108,7 @@ async def list_topics():
 
 @router.get("/topics/{topic_id}", response_model=TopicResponse, tags=["topics"])
 async def get_topic(topic_id: str):
-    """Get a topic by ID."""
+    """Get topic status. Check ``status`` field: pending → ready (tree built) or failed."""
     topic = store.get_topic(topic_id)
     if topic is None:
         raise HTTPException(404, f"Topic {topic_id} not found")
@@ -108,8 +119,8 @@ async def get_topic(topic_id: str):
 async def get_topic_belief_tree(topic_id: str) -> Dict[str, Any]:
     """Get the cached belief tree for a topic.
 
-    The tree is populated after the first debate on this topic runs
-    through its belief prep phase.
+    The tree is populated after the first debate on this topic
+    completes its belief prep phase.
     """
     topic = store.get_topic(topic_id)
     if topic is None:
@@ -126,6 +137,7 @@ async def create_token_only(req: CreateDebateRequest):
     """Create a debate and return LiveKit connection details.
 
     The frontend connects to LiveKit directly with the returned token.
+    Note: this endpoint blocks until the room is created (~5s).
     """
     topic_str = _resolve_topic(req)
     client = _make_client()
@@ -146,49 +158,95 @@ async def create_token_only(req: CreateDebateRequest):
         await client.close()
 
 
-# ── Mode 2: Server-Managed ──────────────────────────────────────────
+# ── Mode 2: Server-Managed (non-blocking) ───────────────────────────
 
 @router.post("/managed", response_model=ManagedResponse)
 async def create_managed(req: CreateDebateRequest):
     """Create a server-managed debate session.
 
-    You can either:
-    - Pass ``topic`` directly (one-shot)
-    - Pass ``topic_id`` referencing a previously created topic (reusable)
+    **Returns immediately** — the actual setup (room creation, agent
+    dispatch, connection) happens in the background.
 
-    Connect via WebSocket at ``/debates/{debate_id}/ws`` to receive events.
+    Connect via WebSocket at ``/debates/{debate_id}/ws`` right away.
+    Events will buffer until the agent is ready, then flush.
+
+    Poll ``GET /debates/{debate_id}/status`` to check readiness,
+    or just connect the WebSocket and wait for ``debate_initializing``.
     """
     topic_str = _resolve_topic(req)
     debate_id = uuid.uuid4().hex[:12]
-    client = _make_client()
     handler = WebSocketDebateHandler()
 
-    config = DebateConfig(
-        topic=topic_str,
-        human_side=req.human_side,
-        coaching_enabled=req.coaching_enabled,
-        evidence_enabled=req.evidence_enabled,
+    # Create pending debate entry so WS connections work immediately
+    pending = store.PendingDebate(
+        debate_id=debate_id,
+        topic_id=req.topic_id,
+        topic_str=topic_str,
+        handler=handler,
     )
-    session = await client.create_managed_session(config, handler)
-    session._handler_ref = handler  # type: ignore[attr-defined]
-    session._client_ref = client    # type: ignore[attr-defined]
-    session._topic_id = req.topic_id  # type: ignore[attr-defined]
-    store.add(debate_id, session)
+    store.add_pending(debate_id, pending)
 
-    # Link debate to topic if using topic_id
+    # Link to topic
     if req.topic_id:
         topic = store.get_topic(req.topic_id)
         if topic:
             topic.debates.append(debate_id)
-            # Set up belief tree caching: when belief_tree event arrives,
-            # cache it on the topic for reuse
             handler._topic_ref = topic  # type: ignore[attr-defined]
+
+    # Kick off setup in background
+    asyncio.create_task(
+        _setup_debate_background(debate_id, topic_str, req, handler)
+    )
 
     return ManagedResponse(
         debate_id=debate_id,
         topic_id=req.topic_id,
         topic=topic_str,
+        status="creating",
     )
+
+
+async def _setup_debate_background(
+    debate_id: str,
+    topic_str: str,
+    req: CreateDebateRequest,
+    handler: WebSocketDebateHandler,
+) -> None:
+    """Background task: create LiveKit room, dispatch agent, connect session."""
+    pending = store.get_pending(debate_id)
+    if not pending:
+        return
+
+    try:
+        client = _make_client()
+        config = DebateConfig(
+            topic=topic_str,
+            human_side=req.human_side,
+            coaching_enabled=req.coaching_enabled,
+            evidence_enabled=req.evidence_enabled,
+        )
+        session = await client.create_managed_session(config, handler)
+        session._handler_ref = handler  # type: ignore[attr-defined]
+        session._client_ref = client    # type: ignore[attr-defined]
+        session._topic_id = req.topic_id  # type: ignore[attr-defined]
+
+        # Promote to active
+        pending.session = session
+        pending.client = client
+        pending.status = "ready"
+        store.promote_pending(debate_id)
+        logger.info("Debate %s setup complete", debate_id)
+
+    except Exception as e:
+        logger.error("Debate %s setup failed: %s", debate_id, e)
+        store.fail_pending(debate_id, str(e))
+        # Send error through handler so WS clients see it
+        await handler._forward({
+            "type": "error",
+            "message": f"Debate setup failed: {e}",
+            "code": "SETUP_FAILED",
+            "recoverable": False,
+        })
 
 
 def _resolve_topic(req: CreateDebateRequest) -> str:
@@ -207,32 +265,54 @@ def _resolve_topic(req: CreateDebateRequest) -> str:
 
 @router.get("/{debate_id}/status", response_model=StatusResponse)
 async def get_status(debate_id: str):
-    """Get the current state of a managed debate session."""
-    session = store.get(debate_id)
-    if session is None:
-        raise HTTPException(404, f"Debate {debate_id} not found")
+    """Get the current state of a debate.
 
-    t = session.tracker
-    return StatusResponse(
-        debate_id=debate_id,
-        connected=session.connected,
-        current_speech=t.current_speech,
-        current_speaker=t.current_speaker,
-        phase=t.phase,
-        is_human_turn=t.is_human_turn,
-        is_cx=t.is_cx,
-        is_complete=t.is_complete,
-        completed_speeches=t.completed_speeches,
-    )
+    Works for both pending (creating) and active debates.
+    """
+    # Check active sessions first
+    session = store.get(debate_id)
+    if session is not None:
+        t = session.tracker
+        return StatusResponse(
+            debate_id=debate_id,
+            connected=session.connected,
+            status="complete" if t.is_complete else "active",
+            current_speech=t.current_speech,
+            current_speaker=t.current_speaker,
+            phase=t.phase,
+            is_human_turn=t.is_human_turn,
+            is_cx=t.is_cx,
+            is_complete=t.is_complete,
+            completed_speeches=t.completed_speeches,
+        )
+
+    # Check pending debates
+    pending = store.get_pending(debate_id)
+    if pending is not None:
+        return StatusResponse(
+            debate_id=debate_id,
+            connected=False,
+            status=pending.status,
+            phase=pending.status,
+            error=pending.error,
+        )
+
+    raise HTTPException(404, f"Debate {debate_id} not found")
 
 
 # ── Belief Tree ──────────────────────────────────────────────────────
 
 def _get_handler(debate_id: str) -> WebSocketDebateHandler:
+    """Get handler from active session or pending debate."""
     session = store.get(debate_id)
-    if session is None:
-        raise HTTPException(404, f"Debate {debate_id} not found")
-    return session._handler_ref  # type: ignore[attr-defined]
+    if session is not None:
+        return session._handler_ref  # type: ignore[attr-defined]
+
+    pending = store.get_pending(debate_id)
+    if pending is not None:
+        return pending.handler
+
+    raise HTTPException(404, f"Debate {debate_id} not found")
 
 
 @router.get("/{debate_id}/belief-tree")
@@ -306,12 +386,7 @@ async def get_events(
     event_type: Optional[str] = None,
     since: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Return event history. Supports filtering by type and timestamp.
-
-    Query params:
-    - event_type: filter to a specific event type (e.g. "speech_text")
-    - since: only events after this unix timestamp (for replay/catch-up)
-    """
+    """Return event history. Supports filtering by type and timestamp."""
     handler = _get_handler(debate_id)
     events = handler.event_history
 
@@ -330,7 +405,7 @@ async def get_transcripts(debate_id: str) -> Dict[str, Any]:
     """Return all recorded speech transcripts."""
     session = store.get(debate_id)
     if session is None:
-        raise HTTPException(404, f"Debate {debate_id} not found")
+        raise HTTPException(404, f"Debate {debate_id} not found or still creating")
 
     t = session.tracker
     return {

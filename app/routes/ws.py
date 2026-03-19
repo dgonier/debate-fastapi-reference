@@ -17,26 +17,17 @@ router = APIRouter()
 async def debate_websocket(ws: WebSocket, debate_id: str):
     """Stream debate events to the client and accept actions.
 
-    **Receiving events:** The server pushes JSON event objects as they arrive
-    from the debate agent. Each has a ``type`` field.
+    Can connect immediately after ``POST /debates/managed`` — events
+    buffer during setup and flush when the WebSocket attaches.
 
-    **Sending actions:** The client sends JSON with an ``action`` field:
-
-    - ``{"action": "submit_speech", "speech_type": "AC", "transcript": "..."}``
-    - ``{"action": "cx_question", "question": "...", "turn_number": 1}``
-    - ``{"action": "cx_answer", "answer": "...", "question_ref": "..."}``
-    - ``{"action": "end_cx", "speech_type": "AC-CX"}``
-    - ``{"action": "skip_cx", "speech_type": "AC-CX"}``
-    - ``{"action": "end_prep_time"}``
-    - ``{"action": "request_coaching", "for_speech": "1AR"}``
-    - ``{"action": "request_evidence", "query": "...", "limit": 5}``
+    **Receiving events:** JSON objects with a ``type`` field.
+    **Sending actions:** JSON with an ``action`` field.
     """
-    session = store.get(debate_id)
-    if session is None:
+    # Find handler from active session or pending debate
+    handler = _find_handler(debate_id)
+    if handler is None:
         await ws.close(code=4004, reason=f"Debate {debate_id} not found")
         return
-
-    handler: WebSocketDebateHandler = session._handler_ref  # type: ignore[attr-defined]
 
     await ws.accept()
     await handler.attach(ws)
@@ -46,8 +37,36 @@ async def debate_websocket(ws: WebSocket, debate_id: str):
         while True:
             data = await ws.receive_json()
             action = data.get("action", "")
-
             logger.info("WS action: %s", action)
+
+            # Get session — may not exist yet if still creating
+            session = store.get(debate_id)
+            if session is None:
+                pending = store.get_pending(debate_id)
+                if pending and pending.status == "creating":
+                    await ws.send_json({
+                        "type": "error",
+                        "message": "Debate is still being set up. Actions will be available shortly.",
+                        "code": "NOT_READY",
+                        "recoverable": True,
+                    })
+                    continue
+                elif pending and pending.status == "failed":
+                    await ws.send_json({
+                        "type": "error",
+                        "message": f"Debate setup failed: {pending.error}",
+                        "code": "SETUP_FAILED",
+                        "recoverable": False,
+                    })
+                    continue
+                else:
+                    await ws.send_json({
+                        "type": "error",
+                        "message": "Debate session not found",
+                        "code": "NOT_FOUND",
+                        "recoverable": False,
+                    })
+                    continue
 
             if action == "submit_speech":
                 await session.submit_speech(
@@ -86,3 +105,16 @@ async def debate_websocket(ws: WebSocket, debate_id: str):
         logger.info("WebSocket disconnected for debate %s", debate_id)
     finally:
         handler.detach()
+
+
+def _find_handler(debate_id: str) -> WebSocketDebateHandler | None:
+    """Find the handler from active session or pending debate."""
+    session = store.get(debate_id)
+    if session is not None:
+        return session._handler_ref  # type: ignore[attr-defined]
+
+    pending = store.get_pending(debate_id)
+    if pending is not None:
+        return pending.handler
+
+    return None

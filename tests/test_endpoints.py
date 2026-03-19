@@ -18,9 +18,11 @@ def _clear_store():
     """Clear the in-memory stores before each test."""
     store._sessions.clear()
     store._topics.clear()
+    store._pending.clear()
     yield
     store._sessions.clear()
     store._topics.clear()
+    store._pending.clear()
 
 
 @pytest.fixture
@@ -79,10 +81,21 @@ class TestStatusEndpoint:
         assert data["current_speech"] == "AC"
         assert data["phase"] == "active"
         assert data["is_human_turn"] is True
+        assert data["status"] == "active"
 
     def test_status_404_when_not_found(self, client):
         resp = client.get("/debates/nonexistent/status")
         assert resp.status_code == 404
+
+    def test_status_pending_debate(self, client):
+        handler = WebSocketDebateHandler()
+        pending = store.PendingDebate("pend1", None, "Test topic", handler)
+        store.add_pending("pend1", pending)
+        resp = client.get("/debates/pend1/status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "creating"
+        assert data["connected"] is False
 
 
 # ── Belief tree endpoints ────────────────────────────────────────────
@@ -219,6 +232,7 @@ class TestTopicEndpoints:
         data = resp.json()
         assert data["topic"] == "UBI is good"
         assert data["topic_id"]
+        assert data["status"] == "pending"
         assert data["has_belief_tree"] is False
         assert data["debate_count"] == 0
 

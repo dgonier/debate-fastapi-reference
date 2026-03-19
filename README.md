@@ -74,9 +74,9 @@ POST /debates/managed
 { "topic_id": "f1a2b3c4d5e6", "human_side": "aff" }
 ```
 
-### 1b. Create a Debate (One-Shot)
+### 1b. Create a Debate
 
-Or skip topic creation and pass the topic inline:
+**Returns immediately** — setup happens in the background (~5-15s). You can pass `topic_id` (reusable) or `topic` (one-shot):
 
 ```http
 POST /debates/managed
@@ -84,24 +84,35 @@ Content-Type: application/json
 
 {
   "topic": "The United States should adopt universal basic income",
-  "human_side": "aff",          // "aff" or "neg"
-  "coaching_enabled": true,     // get coaching hints before speeches
-  "evidence_enabled": true      // get evidence cards during prep
+  "human_side": "aff",
+  "coaching_enabled": true,
+  "evidence_enabled": true
 }
 ```
 
-Response:
+Response (instant):
 ```json
-{ "debate_id": "a1b2c3d4e5f6", "topic": "The United States should adopt universal basic income", "message": "Session created. Connect via WebSocket." }
+{ "debate_id": "a1b2c3d4e5f6", "status": "creating", "topic": "...", "message": "Debate is being created. Connect via WebSocket for events." }
 ```
 
-### 2. Connect WebSocket
+### 2. Connect WebSocket (immediately)
 
 ```
 ws://localhost:8000/debates/{debate_id}/ws
 ```
 
-Events start flowing immediately (buffered events flush on connect). If the debate doesn't exist, the connection closes with code `4004`.
+Connect right after the POST — don't wait. Events buffer during setup and flush when the agent is ready. You'll see `debate_initializing` → `debate_ready` once setup completes.
+
+If you send actions before setup finishes, you'll get a recoverable error:
+```json
+{"type": "error", "message": "Debate is still being set up.", "code": "NOT_READY", "recoverable": true}
+```
+
+You can also poll status:
+```bash
+curl http://localhost:8000/debates/{id}/status
+# {"status": "creating"} → {"status": "active"} → {"status": "complete"}
+```
 
 ### 3. Handle Events (Server -> Client)
 
