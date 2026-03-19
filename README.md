@@ -53,7 +53,7 @@ cx_answer ────────────>     data channel ─────
 
 ### 1a. Create a Topic (Reusable)
 
-Create a topic once, run multiple debates against it. The belief tree gets cached after the first debate so subsequent debates skip the ~30s prep.
+Create a topic once — the belief tree builds in the background. Then run multiple debates against it without repeating the prep.
 
 ```http
 POST /debates/topics
@@ -62,10 +62,25 @@ Content-Type: application/json
 { "topic": "The United States should adopt universal basic income" }
 ```
 
-Response:
+Response (instant):
 ```json
-{ "topic_id": "f1a2b3c4d5e6", "topic": "The United States should adopt universal basic income", "has_belief_tree": false, "debate_count": 0 }
+{ "topic_id": "f1a2b3c4d5e6", "status": "building", "has_belief_tree": false }
 ```
+
+**Poll for readiness:**
+```bash
+# Poll until status is "ready"
+curl http://localhost:8000/debates/topics/f1a2b3c4d5e6
+# {"status": "building", "has_belief_tree": false}  ← still working
+# {"status": "ready", "has_belief_tree": true}       ← tree available
+
+# Get the tree
+curl http://localhost:8000/debates/topics/f1a2b3c4d5e6/belief-tree
+```
+
+Status transitions: `building` → `ready` (tree available) or `failed`.
+
+**You don't have to wait for `ready`** — starting a debate on a `building` topic works fine. The debate agent handles its own prep. But if the topic is `ready`, subsequent debates skip the ~30s prep phase.
 
 Then use `topic_id` when creating debates:
 

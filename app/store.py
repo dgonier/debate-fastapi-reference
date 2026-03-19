@@ -16,7 +16,7 @@ class Topic:
     def __init__(self, topic_id: str, topic: str) -> None:
         self.topic_id = topic_id
         self.topic = topic
-        self.status: str = "pending"  # pending | ready | failed
+        self.status: str = "pending"  # pending | building | ready | failed
         self.belief_tree: Optional[Dict[str, Any]] = None
         self.error: Optional[str] = None
         self.debates: List[str] = []

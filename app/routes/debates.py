@@ -39,7 +39,7 @@ class CreateTopicRequest(BaseModel):
 class TopicResponse(BaseModel):
     topic_id: str
     topic: str
-    status: str = "pending"  # pending | ready | failed
+    status: str = "building"  # building | ready | failed
     has_belief_tree: bool = False
     debate_count: int = 0
     debate_ids: list[str] = []
@@ -86,18 +86,75 @@ class StatusResponse(BaseModel):
 
 @router.post("/topics", response_model=TopicResponse, tags=["topics"])
 async def create_topic(req: CreateTopicRequest):
-    """Create a reusable topic.
+    """Create a topic and start building the belief tree in the background.
 
-    Returns immediately. The belief tree is generated when the first
-    debate on this topic runs (and cached for all subsequent debates).
+    **Returns immediately.** The belief tree builds asynchronously
+    (~30s to 30min depending on topic complexity).
 
-    Poll ``GET /debates/topics/{id}`` to check if the tree is ready,
-    or just start a debate — it will build the tree if needed.
+    Poll ``GET /debates/topics/{id}`` to check status:
+    - ``"building"`` — tree generation in progress
+    - ``"ready"`` — tree available, debates will skip prep
+    - ``"failed"`` — tree generation failed (debates still work, just slower)
+
+    You don't have to wait for ``ready`` — starting a debate on a
+    ``building`` topic works fine; the debate agent handles prep itself.
     """
     topic_id = uuid.uuid4().hex[:12]
     topic = store.Topic(topic_id=topic_id, topic=req.topic)
+    topic.status = "building"
     store.add_topic(topic_id, topic)
+
+    # Kick off background prep debate to build the belief tree
+    asyncio.create_task(_build_topic_tree(topic))
+
     return TopicResponse(**topic.to_dict())
+
+
+async def _build_topic_tree(topic: store.Topic) -> None:
+    """Background: start a prep debate to generate the belief tree.
+
+    Creates a temporary managed session. When the belief_tree event
+    arrives, the handler caches it on the topic. Then we disconnect.
+    """
+    try:
+        client = _make_client()
+        handler = WebSocketDebateHandler()
+        handler._topic_ref = topic  # type: ignore[attr-defined]
+
+        config = DebateConfig(
+            topic=topic.topic,
+            human_side="aff",
+            coaching_enabled=False,
+            evidence_enabled=True,
+        )
+        session = await client.create_managed_session(config, handler)
+
+        # Wait for the belief tree event (timeout after 10 min)
+        for _ in range(600):  # 600 × 1s = 10 min
+            await asyncio.sleep(1)
+            if topic.belief_tree is not None:
+                topic.status = "ready"
+                logger.info("Topic %s tree ready", topic.topic_id)
+                break
+        else:
+            # Didn't get a tree in time — mark ready anyway (debates will do their own prep)
+            topic.status = "ready"
+            logger.warning("Topic %s tree build timed out, marking ready without tree", topic.topic_id)
+
+        # Clean up the prep session
+        try:
+            await session.disconnect()
+        except Exception:
+            pass
+        try:
+            await client.close()
+        except Exception:
+            pass
+
+    except Exception as e:
+        logger.error("Topic %s tree build failed: %s", topic.topic_id, e)
+        topic.status = "failed"
+        topic.error = str(e)
 
 
 @router.get("/topics", response_model=list[TopicResponse], tags=["topics"])
@@ -108,7 +165,13 @@ async def list_topics():
 
 @router.get("/topics/{topic_id}", response_model=TopicResponse, tags=["topics"])
 async def get_topic(topic_id: str):
-    """Get topic status. Check ``status`` field: pending → ready (tree built) or failed."""
+    """Poll topic status.
+
+    ``status`` transitions: ``building`` → ``ready`` (tree available) or ``failed``.
+
+    Once ``ready``, ``has_belief_tree`` is true and
+    ``GET /debates/topics/{id}/belief-tree`` returns the full tree.
+    """
     topic = store.get_topic(topic_id)
     if topic is None:
         raise HTTPException(404, f"Topic {topic_id} not found")

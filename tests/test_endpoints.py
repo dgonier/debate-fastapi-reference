@@ -232,7 +232,7 @@ class TestTopicEndpoints:
         data = resp.json()
         assert data["topic"] == "UBI is good"
         assert data["topic_id"]
-        assert data["status"] == "pending"
+        assert data["status"] == "building"
         assert data["has_belief_tree"] is False
         assert data["debate_count"] == 0
 
