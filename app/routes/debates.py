@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -18,6 +19,15 @@ from .. import store
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/debates", tags=["debates"])
+
+# Langfuse keys for batch ingestion (optional)
+_langfuse_keys: dict | None = None
+_pk = os.environ.get("LANGFUSE_PUBLIC_KEY")
+_sk = os.environ.get("LANGFUSE_SECRET_KEY")
+_url = os.environ.get("LANGFUSE_BASE_URL")
+if _pk and _sk:
+    _langfuse_keys = {"public_key": _pk, "secret_key": _sk, "base_url": _url or "https://langfuse.my-desk.ai"}
+    logger.info("Langfuse batch ingestion configured")
 
 
 def _make_client() -> DebateClient:
@@ -52,6 +62,11 @@ class CreateDebateRequest(BaseModel):
     human_side: str = Field(default="aff", pattern=r"^(aff|neg)$")
     coaching_enabled: bool = True
     evidence_enabled: bool = True
+
+
+class CreateAIDebateRequest(BaseModel):
+    topic: str | None = Field(default=None, min_length=1, description="Inline topic (use this OR topic_id)")
+    topic_id: str | None = Field(default=None, description="Reference a previously created topic")
 
 
 class TokenOnlyResponse(BaseModel):
@@ -238,7 +253,11 @@ async def create_managed(req: CreateDebateRequest):
     """
     topic_str = _resolve_topic(req)
     debate_id = uuid.uuid4().hex[:12]
-    handler = WebSocketDebateHandler()
+    handler = WebSocketDebateHandler(
+        langfuse_keys=_langfuse_keys,
+        debate_id=debate_id,
+        topic_id=req.topic_id or "",
+    )
 
     # Create pending debate entry so WS connections work immediately
     pending = store.PendingDebate(
@@ -303,7 +322,6 @@ async def _setup_debate_background(
     except Exception as e:
         logger.error("Debate %s setup failed: %s", debate_id, e)
         store.fail_pending(debate_id, str(e))
-        # Send error through handler so WS clients see it
         await handler._forward({
             "type": "error",
             "message": f"Debate setup failed: {e}",
@@ -312,7 +330,7 @@ async def _setup_debate_background(
         })
 
 
-def _resolve_topic(req: CreateDebateRequest) -> str:
+def _resolve_topic(req) -> str:
     """Resolve topic string from either topic or topic_id."""
     if req.topic_id:
         topic_obj = store.get_topic(req.topic_id)
@@ -322,6 +340,92 @@ def _resolve_topic(req: CreateDebateRequest) -> str:
     if req.topic:
         return req.topic
     raise HTTPException(400, "Provide either 'topic' or 'topic_id'")
+
+
+# ── Mode 3: AI-vs-AI (non-blocking) ─────────────────────────────────
+
+@router.post("/ai-vs-ai", response_model=ManagedResponse)
+async def create_ai_vs_ai(req: CreateAIDebateRequest):
+    """Create an AI-vs-AI debate where both sides are LLM-generated.
+
+    **Returns immediately** — the debate runs autonomously in the background.
+    Connect via WebSocket at ``/debates/{debate_id}/ws`` to observe events.
+
+    All 7 speeches + CX periods are AI-generated. No human input needed.
+    """
+    topic_str = _resolve_topic(req)
+    debate_id = uuid.uuid4().hex[:12]
+    handler = WebSocketDebateHandler(
+        langfuse_keys=_langfuse_keys,
+        debate_id=debate_id,
+        topic_id=req.topic_id or "",
+    )
+
+    pending = store.PendingDebate(
+        debate_id=debate_id,
+        topic_id=req.topic_id,
+        topic_str=topic_str,
+        handler=handler,
+    )
+    store.add_pending(debate_id, pending)
+
+    if req.topic_id:
+        topic = store.get_topic(req.topic_id)
+        if topic:
+            topic.debates.append(debate_id)
+            handler._topic_ref = topic  # type: ignore[attr-defined]
+
+    asyncio.create_task(
+        _setup_ai_debate_background(debate_id, topic_str, handler)
+    )
+
+    return ManagedResponse(
+        debate_id=debate_id,
+        topic_id=req.topic_id,
+        topic=topic_str,
+        status="creating",
+        message="AI-vs-AI debate is being created. Connect via WebSocket to observe.",
+    )
+
+
+async def _setup_ai_debate_background(
+    debate_id: str,
+    topic_str: str,
+    handler: WebSocketDebateHandler,
+) -> None:
+    """Background: create AI-AI debate session."""
+    pending = store.get_pending(debate_id)
+    if not pending:
+        return
+
+    try:
+        client = _make_client()
+        config = DebateConfig(
+            topic=topic_str,
+            debate_mode="ai_ai",
+            human_side="aff",  # ignored in ai_ai mode
+            coaching_enabled=False,
+            evidence_enabled=False,
+        )
+        session = await client.create_managed_session(config, handler)
+        session._handler_ref = handler  # type: ignore[attr-defined]
+        session._client_ref = client    # type: ignore[attr-defined]
+
+        pending.session = session
+        pending.client = client
+        pending.status = "ready"
+        store.promote_pending(debate_id)
+        logger.info("AI-AI debate %s setup complete", debate_id)
+
+    except Exception as e:
+        logger.error("AI-AI debate %s setup failed: %s", debate_id, e)
+        store.fail_pending(debate_id, str(e))
+        await handler._forward({
+            "type": "error",
+            "message": f"Debate setup failed: {e}",
+            "code": "SETUP_FAILED",
+            "recoverable": False,
+        })
 
 
 # ── Status ───────────────────────────────────────────────────────────

@@ -1,4 +1,4 @@
-"""FastAPI app demonstrating debaterhub-sdk Mode 1 and Mode 2."""
+"""FastAPI app demonstrating debaterhub-sdk Mode 1, Mode 2, and AI-AI debates."""
 
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -15,7 +15,6 @@ from .routes import debates, ws
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
-    # Disconnect all managed sessions on shutdown
     for debate_id in store.all_ids():
         session = store.get(debate_id)
         if session and session.connected:
@@ -27,8 +26,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Debate FastAPI Reference",
-    description="Reference app for debaterhub-sdk: Mode 1 (token-only) and Mode 2 (server-managed)",
-    version="0.1.0",
+    description="Reference app for debaterhub-sdk: Mode 1 (token-only), Mode 2 (server-managed), and AI-AI debates",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
@@ -39,11 +38,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Routes
 app.include_router(debates.router)
 app.include_router(ws.router)
 
-# Static files
 static_dir = Path(__file__).parent.parent / "static"
 app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 

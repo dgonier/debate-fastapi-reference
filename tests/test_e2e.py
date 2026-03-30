@@ -19,7 +19,7 @@ import pytest
 # Allow running from project root
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from app.auto_debater import AutoDebater
+from app.auto_debater import AutoDebater, AIObserver
 
 BASE_URL = os.environ.get("TEST_BASE_URL", "http://localhost:8000")
 
@@ -151,6 +151,51 @@ class TestFullDebateE2E:
         result = await debater.run()
         assert result["success"], f"Neg-side debate failed. Events: {[e['type'] for e in result['events']]}"
         assert result["judge_result"] is not None
+
+
+async def _create_ai_debate(
+    base_url: str,
+    topic: str = "The United States should adopt universal basic income",
+) -> dict:
+    """POST /debates/ai-vs-ai and return the response."""
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{base_url}/debates/ai-vs-ai",
+            json={"topic": topic},
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+class TestAIvsAIDebateE2E:
+    """Full 7-speech AI-vs-AI IPDA debate."""
+
+    @pytest.mark.asyncio
+    async def test_ai_ai_debate_completes(self, base_url):
+        """Create an AI-AI debate, observe all events, verify judge result."""
+        # Step 1: Create AI-AI debate
+        create_resp = await _create_ai_debate(base_url)
+        debate_id = create_resp["debate_id"]
+        assert debate_id
+
+        # Step 2: Observe with AIObserver (no human input)
+        observer = AIObserver(
+            base_url=base_url,
+            debate_id=debate_id,
+            timeout=2400,
+        )
+        result = await observer.run()
+
+        # Step 3: Assertions
+        assert result["success"], f"AI-AI debate did not complete. Events: {[e['type'] for e in result['events']]}"
+        assert result["judge_result"] is not None
+        assert result["judge_result"]["winner"] in ("aff", "neg")
+
+        # All 5 non-CX speeches should have speech_text events (all AI-generated)
+        speech_types = result["speeches_completed"]
+        for speech in ["AC", "NC", "1AR", "NR", "2AR"]:
+            assert speech in speech_types, f"AI speech {speech} missing. Got: {speech_types}"
 
 
 class TestDebateCreation:

@@ -11,6 +11,7 @@ dependencies = [
     "uvicorn[standard]>=0.32.0",
     "pydantic-settings>=2.0.0",
     "debaterhub-sdk @ git+https://github.com/dgonier/debaterhub-sdk.git",
+    "langfuse>=4.0.0",
 ]
 
 [project.optional-dependencies]
