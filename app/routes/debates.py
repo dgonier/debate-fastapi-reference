@@ -8,6 +8,7 @@ import os
 import uuid
 from typing import Any, Dict, List, Optional
 
+import httpx
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
@@ -38,6 +39,44 @@ def _make_client() -> DebateClient:
         agent_name=settings.debate_agent_name,
         warmup_url=settings.warmup_url or None,
     )
+
+
+async def _ensure_agent_warm(handler: WebSocketDebateHandler, max_wait: int = 120) -> None:
+    """Poll the warmup endpoint until the agent container reports 'ready'.
+
+    Sends progress events to the WebSocket so the client knows what's happening.
+    Skips if no warmup URL is configured.
+    """
+    url = settings.warmup_url
+    if not url:
+        return
+
+    async with httpx.AsyncClient() as client:
+        for attempt in range(max_wait // 3):
+            try:
+                resp = await client.get(url, timeout=15.0)
+                resp.raise_for_status()
+                data = resp.json()
+                status = data.get("status", "")
+                containers = data.get("containers", 0)
+
+                if status == "ready" and containers > 0:
+                    logger.info("Agent warm: %s", data)
+                    return
+
+                logger.info("Agent warming (attempt %d): %s", attempt + 1, data)
+                await handler._forward({
+                    "type": "warmup_progress",
+                    "message": f"Warming up debate agent... ({status})",
+                    "attempt": attempt + 1,
+                    "agent_status": status,
+                })
+            except Exception as e:
+                logger.warning("Warmup poll failed (attempt %d): %s", attempt + 1, e)
+
+            await asyncio.sleep(3)
+
+    logger.warning("Agent did not become ready within %ds, proceeding anyway", max_wait)
 
 
 # ── Request / Response Models ────────────────────────────────────────
@@ -136,13 +175,16 @@ async def _build_topic_tree(topic: store.Topic) -> None:
         handler = WebSocketDebateHandler()
         handler._topic_ref = topic  # type: ignore[attr-defined]
 
+        # Ensure agent is warm before creating topic prep session
+        await _ensure_agent_warm(handler)
+
         config = DebateConfig(
             topic=topic.topic,
             human_side="aff",
             coaching_enabled=False,
             evidence_enabled=True,
         )
-        session = await client.create_managed_session(config, handler)
+        session = await client.create_managed_session(config, handler, warmup=False)
 
         # Wait for the belief tree event (timeout after 10 min)
         for _ in range(600):  # 600 × 1s = 10 min
@@ -300,6 +342,9 @@ async def _setup_debate_background(
         return
 
     try:
+        # Ensure the Modal agent container is warm before creating the session
+        await _ensure_agent_warm(handler)
+
         client = _make_client()
         config = DebateConfig(
             topic=topic_str,
@@ -307,7 +352,7 @@ async def _setup_debate_background(
             coaching_enabled=req.coaching_enabled,
             evidence_enabled=req.evidence_enabled,
         )
-        session = await client.create_managed_session(config, handler)
+        session = await client.create_managed_session(config, handler, warmup=False)
         session._handler_ref = handler  # type: ignore[attr-defined]
         session._client_ref = client    # type: ignore[attr-defined]
         session._topic_id = req.topic_id  # type: ignore[attr-defined]
@@ -399,6 +444,9 @@ async def _setup_ai_debate_background(
         return
 
     try:
+        # Ensure the Modal agent container is warm before creating the session
+        await _ensure_agent_warm(handler)
+
         client = _make_client()
         config = DebateConfig(
             topic=topic_str,
@@ -407,7 +455,7 @@ async def _setup_ai_debate_background(
             coaching_enabled=False,
             evidence_enabled=False,
         )
-        session = await client.create_managed_session(config, handler)
+        session = await client.create_managed_session(config, handler, warmup=False)
         session._handler_ref = handler  # type: ignore[attr-defined]
         session._client_ref = client    # type: ignore[attr-defined]
 

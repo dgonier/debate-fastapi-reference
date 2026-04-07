@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -11,6 +12,7 @@ from fastapi.testclient import TestClient
 from app.main import app
 from app import store
 from app.handler import WebSocketDebateHandler
+from app.routes.debates import _ensure_agent_warm
 
 
 @pytest.fixture(autouse=True)
@@ -287,3 +289,67 @@ class TestTopicEndpoints:
         """Must provide either topic or topic_id."""
         resp = client.post("/debates/managed", json={"human_side": "aff"})
         assert resp.status_code == 400 or resp.status_code == 422
+
+
+# ── Warmup polling ──────────────────────────────────────────────────
+
+class TestEnsureAgentWarm:
+    def test_skips_when_no_warmup_url(self):
+        handler = WebSocketDebateHandler()
+        with patch("app.routes.debates.settings") as mock_settings:
+            mock_settings.warmup_url = ""
+            asyncio.get_event_loop().run_until_complete(_ensure_agent_warm(handler))
+        # Should return immediately, no events forwarded
+        assert handler.event_history == []
+
+    def test_returns_immediately_when_ready(self):
+        handler = WebSocketDebateHandler()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {"status": "ready", "containers": 1}
+
+        with patch("app.routes.debates.settings") as mock_settings, \
+             patch("app.routes.debates.httpx.AsyncClient") as mock_client_cls:
+            mock_settings.warmup_url = "https://warmup.example.com"
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            asyncio.get_event_loop().run_until_complete(_ensure_agent_warm(handler))
+
+        # No warmup_progress events since it was ready on first poll
+        assert all(e.get("type") != "warmup_progress" for e in handler.event_history)
+
+    def test_polls_until_ready(self):
+        handler = WebSocketDebateHandler()
+
+        warming_resp = MagicMock()
+        warming_resp.status_code = 200
+        warming_resp.raise_for_status = MagicMock()
+        warming_resp.json.return_value = {"status": "warming", "containers": 0}
+
+        ready_resp = MagicMock()
+        ready_resp.status_code = 200
+        ready_resp.raise_for_status = MagicMock()
+        ready_resp.json.return_value = {"status": "ready", "containers": 1}
+
+        with patch("app.routes.debates.settings") as mock_settings, \
+             patch("app.routes.debates.httpx.AsyncClient") as mock_client_cls, \
+             patch("app.routes.debates.asyncio.sleep", new_callable=AsyncMock):
+            mock_settings.warmup_url = "https://warmup.example.com"
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(side_effect=[warming_resp, warming_resp, ready_resp])
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            asyncio.get_event_loop().run_until_complete(_ensure_agent_warm(handler))
+
+        # Should have sent warmup_progress events for the 2 warming polls
+        progress_events = [e for e in handler.event_history if e.get("type") == "warmup_progress"]
+        assert len(progress_events) == 2
+        assert progress_events[0]["attempt"] == 1
+        assert progress_events[1]["attempt"] == 2
