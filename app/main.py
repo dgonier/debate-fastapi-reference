@@ -27,7 +27,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Debate FastAPI Reference",
     description="Reference app for debaterhub-sdk: Mode 1 (token-only), Mode 2 (server-managed), and AI-AI debates",
-    version="0.2.0",
+    version="0.3.0",
     lifespan=lifespan,
 )
 

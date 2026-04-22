@@ -184,7 +184,20 @@ async def _build_topic_tree(topic: store.Topic) -> None:
             coaching_enabled=False,
             evidence_enabled=True,
         )
-        session = await client.create_managed_session(config, handler, warmup=False)
+
+        # Stall detection — log a warning if the server goes silent
+        # for >2 min. Handy for debugging "topic stuck at building".
+        # The SDK does NOT disconnect; we just surface the stall.
+        async def _on_stall(elapsed: float, silence: float, last_phase: str) -> None:
+            logger.warning(
+                "Topic %s stalled: %.0fs silent at %r (elapsed %.0fs)",
+                topic.topic_id, silence, last_phase, elapsed,
+            )
+
+        session = await client.create_managed_session(
+            config, handler, warmup=False,
+            on_stall=_on_stall, stall_after_seconds=120,
+        )
 
         # Wait for the belief tree event (timeout after 10 min)
         for _ in range(600):  # 600 × 1s = 10 min
