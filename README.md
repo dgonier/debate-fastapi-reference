@@ -365,6 +365,77 @@ debate-fastapi-reference/
 | `LIVEKIT_API_SECRET` | Yes | — | LiveKit API secret |
 | `DEBATE_AGENT_NAME` | No | `human-debate-agent` | Name of the deployed debate agent |
 | `WARMUP_URL` | No | — | Modal warmup endpoint (call before first debate to wake the agent) |
+| `DEBATERHUB_VERBOSE` | No | — | Set to `1` to enable SDK `[EVENT]` / `[LOG]` tracing (see [Diagnosing a Stuck Session](#diagnosing-a-stuck-session)) |
+| `DEBATERHUB_LOG_LEVEL` | No | — | `DEBUG \| INFO \| WARNING \| ERROR` — finer-grained SDK log level |
+
+## Diagnosing a Stuck Session
+
+If a debate sits at `debate_initializing` for a long time, the SDK's
+verbose-logging mode surfaces every server event plus the last
+progress message, so you can see exactly where prep stalled.
+
+**Enable it** (see `.env.example`):
+
+```bash
+export DEBATERHUB_VERBOSE=1
+```
+
+Each inbound server event now emits **two** lines:
+
+```
+15:09:34 [EVENT] [+   9.2s] debate_initializing — [values] Generating values for: Resolved: social …
+15:09:34 [LOG] recv type=debate_initializing {'topic': '…', 'format': 'ipda', …}
+
+15:15:20 [EVENT] [+ 348.4s] debate_initializing — [clash] Detecting clashes: 1 AFF × 1 NEG args
+15:16:34 [EVENT] [+ 421.5s] debate_initializing — [persist] Persisting tree to Neo4j + Weaviate
+15:18:14 [EVENT] [+ 587.0s] debate_ready — Resolved: social media platforms should require …
+```
+
+- `[EVENT]` = scannable per-event trace (phase-by-phase timeline).
+- `[LOG]` = raw frame dumps + framework chatter (parse errors,
+  handler exceptions, connection events).
+
+Grep one or the other out of a session log depending on what you need.
+
+**Stall detection** (SDK-level). If you want your sidecar to react to
+silence rather than wait 10 minutes, the SDK's `on_stall` callback
+fires when no server event has arrived in a configurable window:
+
+```python
+async def on_stall(elapsed: float, silence: float, last_phase: str) -> None:
+    log.warning(
+        "Session stalled: silent for %.0fs, last phase %r",
+        silence, last_phase,
+    )
+
+session = await client.create_managed_session(
+    config=config,
+    handler=handler,
+    on_stall=on_stall,
+    stall_after_seconds=120,   # fire if no event for 2 min
+)
+```
+
+The SDK does NOT disconnect — your callback decides what to do (retry,
+alert, abort, etc.). Re-arms on the next inbound event.
+
+**Shrinking prep time.** Default belief-tree prep can run ~15 min for a
+cold topic. For smoke tests or demos, pass `prep_config` to cut
+breadth/depth — a minimal tree completes in ~5-7 min:
+
+```python
+config = DebateConfig(
+    topic="…",
+    human_side="aff",
+    prep_config={
+        "values_per_side": 1,
+        "beliefs_per_value": 1,
+        "research_per_belief": 1,
+        "arguments_per_leaf": 1,
+        "max_depth": 1,
+    },
+)
+```
 
 ## Key Concepts
 
